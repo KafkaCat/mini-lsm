@@ -16,8 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::mem;
-use std::ops::{Bound, DerefMut};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -25,7 +24,6 @@ use std::sync::atomic::AtomicUsize;
 use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use serde::de::value;
 
 use crate::block::Block;
 use crate::compact::{
@@ -303,7 +301,7 @@ impl LsmStorageInner {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let value = self.state.read().memtable.get(key);
         if let Some(v) = value {
-            if v.len() != 0 {
+            if !v.is_empty() {
                 return Ok(Some(v));
             } else {
                 return Ok(None);
@@ -312,7 +310,7 @@ impl LsmStorageInner {
         for imm_memtable in self.state.read().imm_memtables.iter() {
             let value = imm_memtable.get(key);
             if let Some(v) = value {
-                if v.len() != 0 {
+                if !v.is_empty() {
                     return Ok(Some(v));
                 } else {
                     return Ok(None);

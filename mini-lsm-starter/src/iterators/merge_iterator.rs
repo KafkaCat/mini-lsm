@@ -83,11 +83,10 @@ impl<I: StorageIterator> MergeIterator<I> {
         }
 
         let current = heap.pop().unwrap();
-        let this = Self {
+        Self {
             iters: heap,
             current: Some(current),
-        };
-        this
+        }
     }
 }
 
@@ -151,10 +150,10 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         }
 
         // Otherwise, compare with heap top and swap if necessary.
-        if let Some(mut inner_iter) = self.iters.peek_mut() {
-            if *current < *inner_iter {
-                std::mem::swap(&mut *inner_iter, current);
-            }
+        if let Some(mut inner_iter) = self.iters.peek_mut()
+            && *current < *inner_iter
+        {
+            std::mem::swap(&mut *inner_iter, current);
         }
 
         Ok(())
