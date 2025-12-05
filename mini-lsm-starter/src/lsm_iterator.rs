@@ -120,7 +120,9 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         if self.has_errored {
             bail!("the iterator is tainted");
         }
-        if self.iter.is_valid() && let Err(e) = self.iter.next() {
+        if self.iter.is_valid()
+            && let Err(e) = self.iter.next()
+        {
             self.has_errored = true;
             return Err(e);
         }

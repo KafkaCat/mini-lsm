@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::sync::Arc;
 
 use crate::key::{KeySlice, KeyVec};
@@ -48,44 +45,145 @@ impl BlockIterator {
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        unimplemented!()
+        if block.offsets.is_empty() {
+            return BlockIterator::new(block);
+        }
+        let mut iter = BlockIterator::new(block);
+        iter.seek_to_first();
+        iter
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
-        unimplemented!()
+        if block.offsets.is_empty() {
+            return BlockIterator::new(block);
+        }
+        let mut iter = BlockIterator::new(block);
+        iter.seek_to_key(key);
+        iter
     }
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.block.data[self.value_range.0..self.value_range.1]
     }
 
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.key.is_empty()
+    }
+
+    fn set_current_key_value(&mut self) {
+        let start = self.block.offsets[self.idx] as usize;
+        if self.idx == 0 {
+            debug_assert_eq!(start, 0, "First entry offset should always start from 0");
+        }
+
+        let key_len =
+            u16::from_be_bytes([self.block.data[start], self.block.data[start + 1]]) as usize;
+        self.key = KeyVec::from_vec(self.block.data[start + 2..start + 2 + key_len].to_vec());
+        let value_len = u16::from_be_bytes([
+            self.block.data[start + 2 + key_len],
+            self.block.data[start + 3 + key_len],
+        ]) as usize;
+        self.value_range = (start + key_len + 4, start + key_len + 4 + value_len);
     }
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        unimplemented!()
+        // There is no entry in the block. We reached to the end
+        if self.block.offsets.is_empty() {
+            self.key = KeyVec::new();
+            return;
+        }
+
+        self.idx = 0;
+        self.set_current_key_value();
+        self.first_key = self.key.clone();
     }
 
     /// Move to the next key in the block.
     pub fn next(&mut self) {
-        unimplemented!()
+        self.idx += 1;
+
+        // Out of bondary: we reached to the end of block
+        if self.idx >= self.block.offsets.len() {
+            self.key = KeyVec::new();
+            return;
+        }
+
+        self.set_current_key_value();
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        unimplemented!()
+        // There is no entry in the block. We reached to the end
+        if self.block.offsets.is_empty() {
+            self.key = KeyVec::new();
+            return;
+        }
+
+        let mut idx = 0;
+        loop {
+            if idx >= self.block.offsets.len() {
+                self.key = KeyVec::new();
+                return;
+            }
+            let start = self.block.offsets[idx] as usize;
+            let key_len =
+                u16::from_be_bytes([self.block.data[start], self.block.data[start + 1]]) as usize;
+            let curr_key = &self.block.data[start + 2..start + 2 + key_len];
+            if curr_key >= key.raw_ref() {
+                break;
+            }
+            idx += 1;
+        }
+
+        if idx == 0 {
+            self.seek_to_first();
+        } else {
+            self.idx = idx - 1;
+            self.next();
+        }
+    }
+
+    /// Creates a block iterator and seek to the last entry.
+    pub fn create_and_seek_to_last(block: Arc<Block>) -> Self {
+        if block.offsets.is_empty() {
+            return BlockIterator::new(block);
+        }
+        let mut iter = BlockIterator::new(block);
+        iter.seek_to_last();
+        iter
+    }
+
+    /// Seeks to the last key in the block.
+    pub fn seek_to_last(&mut self) {
+        if self.block.offsets.is_empty() {
+            self.key = KeyVec::new();
+            return;
+        }
+
+        self.idx = self.block.offsets.len() - 1;
+        self.set_current_key_value();
+    }
+
+    /// Move to the previous key in the block.
+    pub fn prev(&mut self) {
+        if self.idx == 0 {
+            self.key = KeyVec::new();
+            return;
+        }
+
+        self.idx -= 1;
+        self.set_current_key_value();
     }
 }
