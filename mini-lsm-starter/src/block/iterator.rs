@@ -76,7 +76,7 @@ impl BlockIterator {
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        self.key.is_empty()
+        !self.key.is_empty()
     }
 
     fn set_current_key_value(&mut self) {
@@ -125,34 +125,27 @@ impl BlockIterator {
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        // There is no entry in the block. We reached to the end
         if self.block.offsets.is_empty() {
             self.key = KeyVec::new();
             return;
         }
 
-        let mut idx = 0;
-        loop {
-            if idx >= self.block.offsets.len() {
-                self.key = KeyVec::new();
-                return;
-            }
-            let start = self.block.offsets[idx] as usize;
+        // Binary search on offsets to find first key >= target
+        let idx = self.block.offsets.partition_point(|&offset| {
+            let start = offset as usize;
             let key_len =
                 u16::from_be_bytes([self.block.data[start], self.block.data[start + 1]]) as usize;
             let curr_key = &self.block.data[start + 2..start + 2 + key_len];
-            if curr_key >= key.raw_ref() {
-                break;
-            }
-            idx += 1;
+            curr_key < key.raw_ref()
+        });
+
+        if idx >= self.block.offsets.len() {
+            self.key = KeyVec::new();
+            return;
         }
 
-        if idx == 0 {
-            self.seek_to_first();
-        } else {
-            self.idx = idx - 1;
-            self.next();
-        }
+        self.idx = idx;
+        self.set_current_key_value();
     }
 
     /// Creates a block iterator and seek to the last entry.

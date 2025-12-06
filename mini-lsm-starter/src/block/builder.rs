@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::key::{Key, KeySlice, KeyVec};
+use crate::key::{Key, KeyBytes, KeySlice, KeyVec};
 use bytes::BufMut;
 
 use super::Block;
@@ -27,6 +27,8 @@ pub struct BlockBuilder {
     block_size: usize,
     /// The first key in the block
     first_key: KeyVec,
+    /// The last key in the block
+    last_key: KeyVec,
 }
 
 fn append_entry(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) {
@@ -44,6 +46,7 @@ impl BlockBuilder {
             data: Vec::new(),
             block_size,
             first_key: Key::new(),
+            last_key: Key::new(),
         }
     }
 
@@ -59,6 +62,7 @@ impl BlockBuilder {
         // Always insert the first key-value entry regardless of size limit as per tutorial
         if self.first_key.is_empty() {
             self.first_key = key.to_key_vec();
+            self.last_key = key.to_key_vec();
             append_entry(&mut self.data, key.raw_ref(), value);
             self.offsets.push(0);
             return true;
@@ -69,6 +73,7 @@ impl BlockBuilder {
             return false;
         }
         append_entry(&mut self.data, key.raw_ref(), value);
+        self.last_key = key.to_key_vec();
         self.offsets.push(start);
 
         true
@@ -90,5 +95,13 @@ impl BlockBuilder {
             data: self.data,
             offsets: self.offsets,
         }
+    }
+
+    pub fn first_key_bytes(&self) -> KeyBytes {
+        self.first_key.clone().into_key_bytes()
+    }
+
+    pub fn last_key_bytes(&self) -> KeyBytes {
+        self.last_key.clone().into_key_bytes()
     }
 }

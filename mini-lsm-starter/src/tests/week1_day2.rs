@@ -314,7 +314,6 @@ fn test_task4_integration() {
         iter.next().unwrap();
         assert!(!iter.is_valid());
     }
-    eprintln!("I'm here. finish the first part of assertion");
     {
         let mut iter = storage
             .scan(Bound::Included(b"2"), Bound::Included(b"3"))
