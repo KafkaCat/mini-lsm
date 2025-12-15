@@ -99,10 +99,22 @@ impl SsTableBuilder {
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
     pub fn build(
+        self,
+        id: usize,
+        block_cache: Option<Arc<BlockCache>>,
+        path: impl AsRef<Path>,
+    ) -> Result<SsTable> {
+        self.build_with_options(id, block_cache, path, false)
+    }
+
+    /// Builds the SSTable with direct I/O option.
+    /// When `direct_io` is true, uses O_DIRECT (Linux) or F_NOCACHE (macOS) to bypass OS page cache.
+    pub fn build_with_options(
         mut self,
         id: usize,
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
+        direct_io: bool,
     ) -> Result<SsTable> {
         // Seal the last and current block
         let block_meta = BlockMeta {
@@ -117,7 +129,13 @@ impl SsTableBuilder {
         let offset = self.data.len();
         BlockMeta::encode_block_meta(&self.meta, &mut self.data);
         self.data.put_u64(offset as u64);
-        let file = FileObject::create(path.as_ref(), self.data)?;
+
+        let file = if direct_io {
+            FileObject::create_direct_io(path.as_ref(), self.data)?
+        } else {
+            FileObject::create(path.as_ref(), self.data)?
+        };
+
         Ok(SsTable {
             file,
             block_meta: self.meta,

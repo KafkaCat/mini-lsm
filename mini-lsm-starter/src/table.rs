@@ -19,8 +19,15 @@ pub(crate) mod bloom;
 mod builder;
 mod iterator;
 
+use std::alloc::{Layout, alloc, dealloc};
 use std::fs::File;
+use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -33,6 +40,92 @@ use crate::key::{KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
+
+/// Block size for direct I/O alignment (4KB)
+pub const BLOCK_ALIGNMENT: usize = 4096;
+
+/// An aligned buffer for direct I/O operations.
+/// Guarantees memory is aligned to BLOCK_ALIGNMENT bytes.
+pub(crate) struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    capacity: usize,
+}
+
+impl AlignedBuffer {
+    /// Create a new aligned buffer with the given capacity (rounded up to BLOCK_ALIGNMENT).
+    fn new(capacity: usize) -> Result<Self> {
+        let capacity = (capacity + BLOCK_ALIGNMENT - 1) & !(BLOCK_ALIGNMENT - 1);
+        let layout = Layout::from_size_align(capacity, BLOCK_ALIGNMENT)
+            .map_err(|e| anyhow::anyhow!("Invalid layout for aligned buffer: {}", e))?;
+        let ptr = unsafe { alloc(layout) };
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            anyhow::anyhow!("Failed to allocate aligned buffer of {} bytes", capacity)
+        })?;
+        Ok(Self {
+            ptr,
+            len: 0,
+            capacity,
+        })
+    }
+
+    /// Create an aligned buffer with specific size, zero-initialized.
+    /// Note: size should be aligned to BLOCK_ALIGNMENT for direct I/O operations.
+    pub(crate) fn with_size(size: usize) -> Result<Self> {
+        debug_assert!(
+            size.is_multiple_of(BLOCK_ALIGNMENT),
+            "with_size() expects aligned size, got {}",
+            size
+        );
+        let mut buf = Self::new(size)?;
+        buf.len = size;
+        unsafe {
+            std::ptr::write_bytes(buf.ptr.as_ptr(), 0, buf.capacity);
+        }
+        Ok(buf)
+    }
+
+    /// Get a mutable slice to the buffer
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Get a slice to the buffer
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Copy data from a slice into the aligned buffer
+    fn copy_from_slice(&mut self, data: &[u8]) {
+        debug_assert!(data.len() <= self.capacity, "Data too large for buffer");
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.as_ptr(), data.len());
+        }
+        self.len = data.len();
+    }
+
+    /// Create an aligned buffer from Vec, padding to alignment for direct I/O writes.
+    pub(crate) fn from_vec_padded(data: Vec<u8>) -> Result<Self> {
+        let padded_len = (data.len() + BLOCK_ALIGNMENT - 1) & !(BLOCK_ALIGNMENT - 1);
+        let mut buf = Self::new(padded_len)?;
+        buf.copy_from_slice(&data);
+        buf.len = padded_len; // Set len to padded size for aligned writes
+        Ok(buf)
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        if let Ok(layout) = Layout::from_size_align(self.capacity, BLOCK_ALIGNMENT) {
+            unsafe {
+                dealloc(self.ptr.as_ptr(), layout);
+            }
+        }
+    }
+}
+
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -77,38 +170,218 @@ impl BlockMeta {
     }
 }
 
-/// A file object.
-pub struct FileObject(Option<File>, u64);
+/// A file object with optional Direct I/O support.
+pub struct FileObject {
+    file: Option<File>,
+    size: u64,
+    direct_io: bool,
+}
 
 impl FileObject {
+    /// Enable direct I/O for the given file descriptor.
+    /// - macOS: Uses fcntl(F_NOCACHE) to disable page cache for this fd
+    /// - Linux: No-op because O_DIRECT is set via custom_flags() during open()
+    #[cfg(target_os = "macos")]
+    fn enable_direct_io(file: &File) -> Result<()> {
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+        if ret == -1 {
+            anyhow::bail!(
+                "Failed to set F_NOCACHE: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    /// Enable direct I/O for the given file descriptor.
+    /// On Linux, O_DIRECT is set via custom_flags() during open(), so this is a no-op.
+    #[cfg(target_os = "linux")]
+    fn enable_direct_io(_file: &File) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fallback for other Unix systems - direct I/O not supported
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+    fn enable_direct_io(_file: &File) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read data from file using aligned buffer for direct I/O
     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
-        let mut data = vec![0; len as usize];
-        self.0
-            .as_ref()
-            .unwrap()
-            .read_exact_at(&mut data[..], offset)?;
-        Ok(data)
+
+        if self.direct_io {
+            let aligned_offset = offset & !(BLOCK_ALIGNMENT as u64 - 1);
+            let offset_diff = (offset - aligned_offset) as usize;
+
+            // Calculate aligned length, but cap at file size to avoid reading past EOF
+            let max_readable = self.size.saturating_sub(aligned_offset) as usize;
+            let desired_aligned_len =
+                (len as usize + offset_diff + BLOCK_ALIGNMENT - 1) & !(BLOCK_ALIGNMENT - 1);
+            let aligned_len = desired_aligned_len
+                .min((max_readable + BLOCK_ALIGNMENT - 1) & !(BLOCK_ALIGNMENT - 1));
+
+            // For reads near EOF, we may need to read less than aligned_len
+            // Use read_at which returns actual bytes read, then verify we got enough
+            let mut buf = AlignedBuffer::with_size(aligned_len)?;
+            let bytes_to_read = max_readable.min(aligned_len);
+            self.file
+                .as_ref()
+                .unwrap()
+                .read_exact_at(&mut buf.as_mut_slice()[..bytes_to_read], aligned_offset)?;
+
+            Ok(buf.as_slice()[offset_diff..offset_diff + len as usize].to_vec())
+        } else {
+            let mut data = vec![0; len as usize];
+            self.file
+                .as_ref()
+                .unwrap()
+                .read_exact_at(&mut data[..], offset)?;
+            Ok(data)
+        }
     }
 
     pub fn size(&self) -> u64 {
-        self.1
+        self.size
     }
 
-    /// Create a new file object (day 2) and write the file to the disk (day 4).
+    /// Create a new file object with direct I/O disabled (for compatibility)
     pub fn create(path: &Path, data: Vec<u8>) -> Result<Self> {
         std::fs::write(path, &data)?;
         File::open(path)?.sync_all()?;
-        Ok(FileObject(
-            Some(File::options().read(true).write(false).open(path)?),
-            data.len() as u64,
-        ))
+        Ok(FileObject {
+            file: Some(File::options().read(true).write(false).open(path)?),
+            size: data.len() as u64,
+            direct_io: false,
+        })
     }
 
+    /// Create a new file object with Direct I/O enabled.
+    ///
+    /// The write process:
+    /// 1. Write padded data (aligned to BLOCK_ALIGNMENT) with direct I/O
+    /// 2. Truncate file to actual size (removes padding)
+    /// 3. Sync to disk
+    /// 4. Reopen as read-only for the FileObject
+    pub fn create_direct_io(path: &Path, data: Vec<u8>) -> Result<Self> {
+        let actual_size = data.len() as u64;
+        let aligned_buf = AlignedBuffer::from_vec_padded(data)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            // Write with O_DIRECT (requires aligned writes)
+            let mut file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)?;
+            file.write_all(aligned_buf.as_slice())?;
+            // Truncate to actual size before sync (removes padding)
+            file.set_len(actual_size)?;
+            file.sync_all()?;
+            drop(file);
+
+            // Reopen as read-only with O_DIRECT
+            let file = File::options()
+                .read(true)
+                .write(false)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)?;
+            return Ok(FileObject {
+                file: Some(file),
+                size: actual_size,
+                direct_io: true,
+            });
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // macOS: F_NOCACHE is set via fcntl after open
+            let mut file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?;
+            Self::enable_direct_io(&file)?;
+            file.write_all(aligned_buf.as_slice())?;
+            // Truncate to actual size before sync (removes padding)
+            file.set_len(actual_size)?;
+            file.sync_all()?;
+            drop(file);
+
+            // Reopen as read-only with F_NOCACHE
+            let file = File::options().read(true).write(false).open(path)?;
+            Self::enable_direct_io(&file)?;
+            Ok(FileObject {
+                file: Some(file),
+                size: actual_size,
+                direct_io: true,
+            })
+        }
+
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+        {
+            // Fallback: no direct I/O support, write normally
+            let mut file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?;
+            file.write_all(&aligned_buf.as_slice()[..actual_size as usize])?;
+            file.sync_all()?;
+            drop(file);
+            let file = File::options().read(true).write(false).open(path)?;
+            return Ok(FileObject {
+                file: Some(file),
+                size: actual_size,
+                direct_io: false, // No actual direct I/O on this platform
+            });
+        }
+    }
+
+    /// Open an existing file without direct I/O (for compatibility)
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::options().read(true).write(false).open(path)?;
         let size = file.metadata()?.len();
-        Ok(FileObject(Some(file), size))
+        Ok(FileObject {
+            file: Some(file),
+            size,
+            direct_io: false,
+        })
+    }
+
+    /// Open an existing file with Direct I/O enabled
+    pub fn open_direct_io(path: &Path) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let file = File::options()
+            .read(true)
+            .write(false)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+
+        #[cfg(target_os = "macos")]
+        let file = {
+            let file = File::options().read(true).write(false).open(path)?;
+            Self::enable_direct_io(&file)?;
+            file
+        };
+
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+        let file = File::options().read(true).write(false).open(path)?;
+
+        let size = file.metadata()?.len();
+        Ok(FileObject {
+            file: Some(file),
+            size,
+            direct_io: true,
+        })
+    }
+
+    /// Check if direct I/O is enabled
+    pub fn is_direct_io(&self) -> bool {
+        self.direct_io
     }
 }
 
@@ -165,7 +438,11 @@ impl SsTable {
         last_key: KeyBytes,
     ) -> Self {
         Self {
-            file: FileObject(None, file_size),
+            file: FileObject {
+                file: None,
+                size: file_size,
+                direct_io: false,
+            },
             block_meta: vec![],
             block_meta_offset: 0,
             id,
@@ -240,7 +517,7 @@ impl SsTable {
     }
 
     pub fn table_size(&self) -> u64 {
-        self.file.1
+        self.file.size
     }
 
     pub fn sst_id(&self) -> usize {

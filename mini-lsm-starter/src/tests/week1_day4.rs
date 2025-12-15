@@ -163,3 +163,56 @@ fn test_sst_seek_key() {
             .unwrap();
     }
 }
+
+/// Test SSTable build and read with Direct I/O enabled
+#[test]
+fn test_sst_direct_io() {
+    // Build SST with direct I/O
+    let mut builder = SsTableBuilder::new(128);
+    for idx in 0..num_of_keys() {
+        let key = key_of(idx);
+        let value = value_of(idx);
+        builder.add(key.as_key_slice(), &value[..]);
+    }
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("direct_io.sst");
+
+    // Use build_with_options with direct_io=true
+    let sst = builder.build_with_options(0, None, &path, true).unwrap();
+
+    // Verify the file was created with direct I/O flag
+    assert!(sst.file.is_direct_io());
+
+    // Verify first and last keys
+    assert_eq!(sst.first_key().as_key_slice(), key_of(0).as_key_slice());
+    assert_eq!(
+        sst.last_key().as_key_slice(),
+        key_of(num_of_keys() - 1).as_key_slice()
+    );
+
+    // Test iteration works correctly with direct I/O
+    let sst = Arc::new(sst);
+    let mut iter = SsTableIterator::create_and_seek_to_first(sst).unwrap();
+
+    for i in 0..num_of_keys() {
+        assert!(iter.is_valid());
+        let key = iter.key();
+        let value = iter.value();
+        assert_eq!(
+            key.for_testing_key_ref(),
+            key_of(i).for_testing_key_ref(),
+            "direct I/O: expected key: {:?}, actual key: {:?}",
+            as_bytes(key_of(i).for_testing_key_ref()),
+            as_bytes(key.for_testing_key_ref())
+        );
+        assert_eq!(
+            value,
+            value_of(i),
+            "direct I/O: expected value: {:?}, actual value: {:?}",
+            as_bytes(&value_of(i)),
+            as_bytes(value)
+        );
+        iter.next().unwrap();
+    }
+    assert!(!iter.is_valid());
+}
