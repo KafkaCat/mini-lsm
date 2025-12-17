@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::{Ok, Result};
+use anyhow::{Ok, Result, anyhow};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -30,12 +30,15 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -299,7 +302,12 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let value = self.state.read().memtable.get(key);
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        }; // drop global lock here
+
+        let value = snapshot.memtable.get(key);
         if let Some(v) = value {
             if !v.is_empty() {
                 return Ok(Some(v));
@@ -307,7 +315,7 @@ impl LsmStorageInner {
                 return Ok(None);
             }
         }
-        for imm_memtable in self.state.read().imm_memtables.iter() {
+        for imm_memtable in snapshot.imm_memtables.iter() {
             let value = imm_memtable.get(key);
             if let Some(v) = value {
                 if !v.is_empty() {
@@ -316,6 +324,75 @@ impl LsmStorageInner {
                     return Ok(None);
                 }
             }
+        }
+
+        // L0 ssts - create iterators in parallel
+        let l0_ssts: Vec<_> = snapshot
+            .l0_sstables
+            .iter()
+            .map(|sst_id| {
+                snapshot
+                    .sstables
+                    .get(sst_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Sstable {sst_id} doesn't exist in the snapshot"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let l0_iters: Vec<Box<SsTableIterator>> = std::thread::scope(|s| {
+            let handles: Vec<_> = l0_ssts
+                .into_iter()
+                .map(|sst| {
+                    s.spawn(move || {
+                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("Thread panicked").map(Box::new))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let l0_iter = MergeIterator::create(l0_iters);
+
+        // L1+ ssts - create iterators in parallel
+        let level_ssts: Vec<_> = snapshot
+            .levels
+            .iter()
+            .flat_map(|(_, sst_level)| sst_level.iter())
+            .map(|sst_id| {
+                snapshot
+                    .sstables
+                    .get(sst_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Sstable {sst_id} doesn't exist in the snapshot"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let sst_iters: Vec<Box<SsTableIterator>> = std::thread::scope(|s| {
+            let handles: Vec<_> = level_ssts
+                .into_iter()
+                .map(|sst| {
+                    s.spawn(move || {
+                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("Thread panicked").map(Box::new))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let sst_iter = MergeIterator::create(sst_iters);
+        let sst_merge_iterator = TwoMergeIterator::create(l0_iter, sst_iter)?;
+
+        if sst_merge_iterator.is_valid()
+            && sst_merge_iterator.key().raw_ref() == key
+            && !sst_merge_iterator.value().is_empty()
+        {
+            return Ok(Some(Bytes::copy_from_slice(sst_merge_iterator.value())));
         }
 
         Ok(None)
@@ -417,6 +494,38 @@ impl LsmStorageInner {
         }
         let memtable_iter = MergeIterator::create(memtable_iters);
 
-        Ok(FusedIterator::new(LsmIterator::new(memtable_iter)?))
+        // At this stage we only consider L0-ssts. Will expand to further levels in future chapters
+        let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for sst_id in &snapshot.l0_sstables {
+            if let Some(sst) = snapshot.sstables.get(sst_id) {
+                let iter = match lower {
+                    Bound::Included(low) => SsTableIterator::create_and_seek_to_key(
+                        sst.clone(),
+                        KeySlice::from_slice(low),
+                    )?,
+                    Bound::Excluded(low) => {
+                        let mut iter = SsTableIterator::create_and_seek_to_key(
+                            sst.clone(),
+                            KeySlice::from_slice(low),
+                        )?;
+                        if iter.is_valid() && iter.key().raw_ref() == low {
+                            iter.next()?;
+                        }
+                        iter
+                    }
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst.clone())?,
+                };
+                l0_iters.push(Box::new(iter));
+            } else {
+                return Err(anyhow!("Sstable {sst_id} doesn't exist in the snapshot"));
+            }
+        }
+        let l0_iter = MergeIterator::create(l0_iters);
+
+        let two_merge_iterator = TwoMergeIterator::create(memtable_iter, l0_iter)?;
+        Ok(FusedIterator::new(LsmIterator::new(
+            two_merge_iterator,
+            map_bound(upper),
+        )?))
     }
 }
