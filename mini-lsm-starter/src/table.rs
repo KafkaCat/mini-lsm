@@ -411,11 +411,18 @@ impl SsTable {
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let bytes: [u8; 8] = file.read(file.size() - 8, 8)?[..].try_into().unwrap();
+        let bloom_offset = u64::from_be_bytes(bytes);
+        let bytes = file.read(bloom_offset, file.size() - 8 - bloom_offset)?;
+        let bloom = Bloom::decode(&bytes)?;
+        eprintln!("[debug] I decoded bloom filter");
+
+        let bytes: [u8; 8] = file.read(bloom_offset - 8, 8)?[..].try_into().unwrap();
         let meta_block_offset = u64::from_be_bytes(bytes);
-        let bytes = file.read(meta_block_offset, file.size() - 8 - meta_block_offset)?;
+        let bytes = file.read(meta_block_offset, bloom_offset - 8 - meta_block_offset)?;
         let meta = BlockMeta::decode_block_meta(&*bytes);
         let first_key = meta.first().expect("meta first is empty").first_key.clone();
         let last_key = meta.last().expect("meta last is empty").last_key.clone();
+        eprintln!("[debug] I decoded block metadatas and keys");
 
         Ok(Self {
             file,
@@ -425,7 +432,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

@@ -23,7 +23,7 @@ use crate::{
     block::BlockBuilder,
     key::{KeySlice, KeyVec},
     lsm_storage::BlockCache,
-    table::FileObject,
+    table::{FileObject, bloom::Bloom},
 };
 
 /// Builds an SSTable from key-value pairs.
@@ -32,6 +32,7 @@ pub struct SsTableBuilder {
     first_key: Vec<u8>,
     last_key: Vec<u8>,
     data: Vec<u8>,
+    key_hashes: Vec<u32>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
 }
@@ -44,6 +45,7 @@ impl SsTableBuilder {
             first_key: Vec::new(),
             last_key: Vec::new(),
             data: Vec::new(),
+            key_hashes: Vec::new(),
             meta: Vec::new(),
             block_size,
         }
@@ -57,6 +59,7 @@ impl SsTableBuilder {
         if self.first_key.is_empty() {
             self.first_key = key.raw_ref().to_vec();
         }
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
         if !self.builder.add(key, value) {
             // Create a new block builder and make it current
@@ -120,9 +123,23 @@ impl SsTableBuilder {
         self.data.extend_from_slice(&sealed_block);
         self.meta.push(block_meta);
 
-        let offset = self.data.len();
+        // Encode block metadata
+        // -----------------------------------------------------------------------------------------------------
+        // |         Block Section         |                            Meta Section                           |
+        // -----------------------------------------------------------------------------------------------------
+        // | data block | ... | data block | metadata | meta block offset | bloom filter | bloom filter offset |
+        // |                               |  varlen  |         u64       |    varlen    |        u64          |
+        // -----------------------------------------------------------------------------------------------------
+        let block_meta_offset = self.data.len();
         BlockMeta::encode_block_meta(&self.meta, &mut self.data);
-        self.data.put_u64(offset as u64);
+        self.data.put_u64(block_meta_offset as u64);
+
+        // Encode bloom filter
+        let bloom_offset = self.data.len();
+        let bits_per_key = Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01);
+        let bloom = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
+        bloom.encode(&mut self.data);
+        self.data.put_u64(bloom_offset as u64);
 
         let file = if direct_io {
             FileObject::create_direct_io(path.as_ref(), self.data)?
@@ -133,12 +150,12 @@ impl SsTableBuilder {
         Ok(SsTable {
             file,
             block_meta: self.meta,
-            block_meta_offset: offset,
+            block_meta_offset,
             id,
             block_cache,
             first_key: KeyVec::from_vec(self.first_key).into_key_bytes(),
             last_key: KeyVec::from_vec(self.last_key).into_key_bytes(),
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0_u64,
         })
     }

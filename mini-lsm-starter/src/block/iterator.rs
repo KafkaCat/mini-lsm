@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use nom::Slice;
+
 use crate::key::{KeySlice, KeyVec};
 
 use super::Block;
@@ -79,33 +81,70 @@ impl BlockIterator {
         !self.key.is_empty()
     }
 
+    /// Initialize first_key by reading the first entry. Must be called before any seek operation.
+    fn init_first_key(&mut self) {
+        if !self.first_key.is_empty() || self.block.offsets.is_empty() {
+            // Either first key is already initialized or the block is empty
+            return;
+        }
+        let key_len = u16::from_be_bytes([self.block.data[0], self.block.data[1]]) as usize;
+        self.first_key = KeyVec::from_vec(self.block.data[2..2 + key_len].to_vec());
+    }
+
+    fn decode_key(&self, start: usize) -> (KeyVec, usize) {
+        if start == 0 {
+            let key_len =
+                u16::from_be_bytes([self.block.data[start], self.block.data[start + 1]]) as usize;
+            (
+                KeyVec::from_vec(self.block.data[start + 2..start + 2 + key_len].to_vec()),
+                key_len,
+            )
+        } else {
+            let key_overlap_len =
+                u16::from_be_bytes([self.block.data[start], self.block.data[start + 1]]) as usize;
+            let key_rest_len =
+                u16::from_be_bytes([self.block.data[start + 2], self.block.data[start + 3]])
+                    as usize;
+            let rest_key = &self.block.data[start + 4..start + 4 + key_rest_len];
+            let mut prefix = self.first_key.raw_ref().slice(0..key_overlap_len).to_vec();
+            prefix.extend_from_slice(rest_key);
+            (KeyVec::from_vec(prefix), key_rest_len)
+        }
+    }
+
     fn set_current_key_value(&mut self) {
         let start = self.block.offsets[self.idx] as usize;
         if self.idx == 0 {
             debug_assert_eq!(start, 0, "First entry offset should always start from 0");
         }
+        let (key, key_len) = self.decode_key(start);
+        self.key = key;
 
-        let key_len =
-            u16::from_be_bytes([self.block.data[start], self.block.data[start + 1]]) as usize;
-        self.key = KeyVec::from_vec(self.block.data[start + 2..start + 2 + key_len].to_vec());
-        let value_len = u16::from_be_bytes([
-            self.block.data[start + 2 + key_len],
-            self.block.data[start + 3 + key_len],
-        ]) as usize;
-        self.value_range = (start + key_len + 4, start + key_len + 4 + value_len);
+        if start == 0 {
+            let value_len = u16::from_be_bytes([
+                self.block.data[start + 2 + key_len],
+                self.block.data[start + 3 + key_len],
+            ]) as usize;
+            self.value_range = (start + key_len + 4, start + key_len + 4 + value_len);
+        } else {
+            let value_len = u16::from_be_bytes([
+                self.block.data[start + 4 + key_len],
+                self.block.data[start + 5 + key_len],
+            ]) as usize;
+            self.value_range = (start + key_len + 6, start + key_len + 6 + value_len);
+        }
     }
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        // There is no entry in the block. We reached to the end
         if self.block.offsets.is_empty() {
             self.key = KeyVec::new();
             return;
         }
 
+        self.init_first_key();
         self.idx = 0;
         self.set_current_key_value();
-        self.first_key = self.key.clone();
     }
 
     /// Move to the next key in the block.
@@ -130,13 +169,13 @@ impl BlockIterator {
             return;
         }
 
+        self.init_first_key();
+
         // Binary search on offsets to find first key >= target
         let idx = self.block.offsets.partition_point(|&offset| {
             let start = offset as usize;
-            let key_len =
-                u16::from_be_bytes([self.block.data[start], self.block.data[start + 1]]) as usize;
-            let curr_key = &self.block.data[start + 2..start + 2 + key_len];
-            curr_key < key.raw_ref()
+            let curr_key = self.decode_key(start).0;
+            curr_key.raw_ref() < key.raw_ref()
         });
 
         if idx >= self.block.offsets.len() {
@@ -165,6 +204,9 @@ impl BlockIterator {
             return;
         }
 
+        self.init_first_key();
+
+        // Then seek to the last entry
         self.idx = self.block.offsets.len() - 1;
         self.set_current_key_value();
     }

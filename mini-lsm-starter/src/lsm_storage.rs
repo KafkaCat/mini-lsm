@@ -358,10 +358,28 @@ impl LsmStorageInner {
         let l0_iters: Vec<Box<SsTableIterator>> = std::thread::scope(|s| {
             let handles: Vec<_> = l0_ssts
                 .into_iter()
-                .map(|sst| {
-                    s.spawn(move || {
-                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))
-                    })
+                .filter_map(|sst| {
+                    if skip_sst(
+                        Bound::Included(key),
+                        Bound::Included(key),
+                        sst.first_key(),
+                        sst.last_key(),
+                    ) {
+                        None
+                    } else if sst.bloom.is_some()
+                        && !sst
+                            .bloom
+                            .as_ref()
+                            .unwrap()
+                            .may_contain(farmhash::fingerprint32(key))
+                    {
+                        // Bloom filter says key definitely NOT in this SST, skip it
+                        None
+                    } else {
+                        Some(s.spawn(move || {
+                            SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))
+                        }))
+                    }
                 })
                 .collect();
 
@@ -389,10 +407,28 @@ impl LsmStorageInner {
         let sst_iters: Vec<Box<SsTableIterator>> = std::thread::scope(|s| {
             let handles: Vec<_> = level_ssts
                 .into_iter()
-                .map(|sst| {
-                    s.spawn(move || {
-                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))
-                    })
+                .filter_map(|sst| {
+                    if skip_sst(
+                        Bound::Included(key),
+                        Bound::Included(key),
+                        sst.first_key(),
+                        sst.last_key(),
+                    ) {
+                        None
+                    } else if sst.bloom.is_some()
+                        && !sst
+                            .bloom
+                            .as_ref()
+                            .unwrap()
+                            .may_contain(farmhash::fingerprint32(key))
+                    {
+                        // Bloom filter says key definitely NOT in this SST, skip it
+                        None
+                    } else {
+                        Some(s.spawn(move || {
+                            SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))
+                        }))
+                    }
                 })
                 .collect();
 
