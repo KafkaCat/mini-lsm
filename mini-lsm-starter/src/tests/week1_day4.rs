@@ -105,7 +105,6 @@ fn test_sst_iterator() {
     for _ in 0..5 {
         for i in 0..num_of_keys() {
             let key = iter.key();
-            eprintln!("[debug] key: {:?}", as_bytes(key.for_testing_key_ref()));
             let value = iter.value();
             assert_eq!(
                 key.for_testing_key_ref(),
@@ -149,10 +148,6 @@ fn test_sst_seek_key() {
                 "expected value: {:?}, actual value: {:?}",
                 as_bytes(&value_of(i)),
                 as_bytes(value)
-            );
-            eprintln!(
-                "[debug] key to see is: {}",
-                &format!("key_{:03}", i * 5 + offset)
             );
             iter.seek_to_key(KeySlice::for_testing_from_slice_no_ts(
                 &format!("key_{:03}", i * 5 + offset).into_bytes(),

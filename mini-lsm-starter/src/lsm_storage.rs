@@ -33,12 +33,12 @@ use crate::compact::{
 use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::KeySlice;
+use crate::key::{Key, KeySlice};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -173,7 +173,15 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(()).ok();
+        let mut flush_thread = self.flush_thread.lock();
+        if let Some(flush_thread) = flush_thread.take() {
+            flush_thread
+                .join()
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -229,6 +237,10 @@ impl MiniLsm {
         self.inner.scan(lower, upper)
     }
 
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<FusedIterator<LsmIterator>> {
+        self.inner.scan_prefix(prefix)
+    }
+
     /// Only call this in test cases due to race conditions
     pub fn force_flush(&self) -> Result<()> {
         if !self.inner.state.read().memtable.is_empty() {
@@ -259,6 +271,10 @@ impl LsmStorageInner {
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        if !path.as_ref().exists() {
+            std::fs::create_dir_all(path.as_ref())?;
+        }
+
         let path = path.as_ref();
         let state = LsmStorageState::create(&options);
 
@@ -468,7 +484,47 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        }; // drop global lock here
+
+        if snapshot.imm_memtables.is_empty() {
+            return Ok(());
+        }
+
+        // Flush to new sst
+        let memtable_to_flush = snapshot
+            .imm_memtables
+            .last()
+            .ok_or(anyhow!(
+                "Unknown erro getting the earliest immutable memtables"
+            ))?
+            .clone();
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush.flush(&mut sst_builder)?;
+        let sst = sst_builder.build(
+            memtable_to_flush.id(),
+            Some(self.block_cache.clone()),
+            self.path_of_sst(memtable_to_flush.id()),
+        )?;
+
+        // Mutate the state
+        {
+            let mut guard = self.state.write();
+            let mut state = guard.as_ref().clone();
+            state.imm_memtables.pop().unwrap();
+            if self.compaction_controller.flush_to_l0() {
+                // newer sst are always at front of the list
+                state.l0_sstables.insert(0, sst.sst_id());
+            }
+            state.sstables.insert(sst.sst_id(), Arc::new(sst));
+            *guard = Arc::new(state);
+        }
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -498,6 +554,10 @@ impl LsmStorageInner {
         let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for sst_id in &snapshot.l0_sstables {
             if let Some(sst) = snapshot.sstables.get(sst_id) {
+                if skip_sst(lower, upper, sst.first_key(), sst.last_key()) {
+                    continue;
+                }
+
                 let iter = match lower {
                     Bound::Included(low) => SsTableIterator::create_and_seek_to_key(
                         sst.clone(),
@@ -528,4 +588,46 @@ impl LsmStorageInner {
             map_bound(upper),
         )?))
     }
+}
+
+impl LsmStorageInner {
+    /// Scan all keys with the given prefix.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<FusedIterator<LsmIterator>> {
+        let lower = Bound::Included(prefix);
+        // Compute upper bound: find rightmost non-0xFF byte and increment it
+        let mut upper_buf = prefix.to_vec();
+        let upper = loop {
+            if let Some(&last) = upper_buf.last() {
+                if last == 0xFF {
+                    upper_buf.pop();
+                } else {
+                    *upper_buf.last_mut().unwrap() += 1;
+                    break Bound::Excluded(upper_buf.as_slice());
+                }
+            } else {
+                break Bound::Unbounded;
+            }
+        };
+        self.scan(lower, upper)
+    }
+}
+
+fn skip_sst(
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+    first_key: &Key<bytes::Bytes>,
+    last_key: &Key<bytes::Bytes>,
+) -> bool {
+    let skip_low = match lower {
+        Bound::Included(low) => last_key.raw_ref() < low,
+        Bound::Excluded(low) => last_key.raw_ref() <= low,
+        Bound::Unbounded => false,
+    };
+    let skip_up = match upper {
+        Bound::Included(up) => first_key.raw_ref() > up,
+        Bound::Excluded(up) => first_key.raw_ref() >= up,
+        Bound::Unbounded => false,
+    };
+
+    skip_low || skip_up
 }

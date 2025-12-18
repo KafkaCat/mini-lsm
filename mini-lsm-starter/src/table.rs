@@ -458,20 +458,12 @@ impl SsTable {
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
         if block_idx == self.block_meta.len() - 1 {
             let len = self.block_meta_offset - self.block_meta[block_idx].offset;
-            eprintln!(
-                "[debug] index: {}, offset: {}, len: {}",
-                block_idx, self.block_meta[block_idx].offset, len
-            );
             let block_data_raw = self
                 .file
                 .read(self.block_meta[block_idx].offset as u64, len as u64)?;
             Ok(Arc::new(Block::decode(&block_data_raw)))
         } else if block_idx < self.block_meta.len() - 1 {
             let len = self.block_meta[block_idx + 1].offset - self.block_meta[block_idx].offset;
-            eprintln!(
-                "[debug] index: {}, offset: {}, len: {}",
-                block_idx, self.block_meta[block_idx].offset, len
-            );
             let block_data_raw = self
                 .file
                 .read(self.block_meta[block_idx].offset as u64, len as u64)?;

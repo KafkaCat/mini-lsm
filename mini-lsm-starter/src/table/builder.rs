@@ -59,11 +59,6 @@ impl SsTableBuilder {
         }
 
         if !self.builder.add(key, value) {
-            eprintln!(
-                "[debug] add: block full, sealing. key={:?}, current_blocks={}",
-                key.raw_ref(),
-                self.meta.len()
-            );
             // Create a new block builder and make it current
             let mut new_builder = BlockBuilder::new(self.block_size);
             let res = new_builder.add(key, value);
@@ -71,7 +66,6 @@ impl SsTableBuilder {
             let old_block_builder = std::mem::replace(&mut self.builder, new_builder);
 
             self.seal_block(old_block_builder);
-            eprintln!("[debug] add: after seal, total_blocks={}", self.meta.len());
         }
 
         self.last_key = key.raw_ref().to_vec();
