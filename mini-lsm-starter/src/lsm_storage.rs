@@ -31,6 +31,7 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::{Key, KeySlice};
@@ -390,11 +391,10 @@ impl LsmStorageInner {
         })?;
         let l0_iter = MergeIterator::create(l0_iters);
 
-        // L1+ ssts - create iterators in parallel
-        let level_ssts: Vec<_> = snapshot
-            .levels
+        // L1 ssts - create iterators in parallel
+        let l1_ssts: Vec<_> = snapshot.levels[0]
+            .1
             .iter()
-            .flat_map(|(_, sst_level)| sst_level.iter())
             .map(|sst_id| {
                 snapshot
                     .sstables
@@ -403,42 +403,82 @@ impl LsmStorageInner {
                     .ok_or_else(|| anyhow!("Sstable {sst_id} doesn't exist in the snapshot"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let l1_filtered_ssts = l1_ssts
+            .into_iter()
+            .filter_map(|sst| {
+                if skip_sst(
+                    Bound::Included(key),
+                    Bound::Included(key),
+                    sst.first_key(),
+                    sst.last_key(),
+                ) {
+                    None
+                } else if sst.bloom.is_some()
+                    && !sst
+                        .bloom
+                        .as_ref()
+                        .unwrap()
+                        .may_contain(farmhash::fingerprint32(key))
+                {
+                    // Bloom filter says key definitely NOT in this SST, skip it
+                    None
+                } else {
+                    Some(sst)
+                }
+            })
+            .collect::<Vec<_>>();
+        let l1_concat_iter =
+            SstConcatIterator::create_and_seek_to_key(l1_filtered_ssts, KeySlice::from_slice(key))?;
 
-        let sst_iters: Vec<Box<SsTableIterator>> = std::thread::scope(|s| {
-            let handles: Vec<_> = level_ssts
-                .into_iter()
-                .filter_map(|sst| {
-                    if skip_sst(
-                        Bound::Included(key),
-                        Bound::Included(key),
-                        sst.first_key(),
-                        sst.last_key(),
-                    ) {
-                        None
-                    } else if sst.bloom.is_some()
-                        && !sst
-                            .bloom
-                            .as_ref()
-                            .unwrap()
-                            .may_contain(farmhash::fingerprint32(key))
-                    {
-                        // Bloom filter says key definitely NOT in this SST, skip it
-                        None
-                    } else {
-                        Some(s.spawn(move || {
-                            SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))
-                        }))
-                    }
-                })
-                .collect();
+        // // L1+ ssts
+        // let level_ssts: Vec<_> = snapshot
+        //     .levels
+        //     .iter()
+        //     .flat_map(|(_, sst_level)| sst_level.iter())
+        //     .map(|sst_id| {
+        //         snapshot
+        //             .sstables
+        //             .get(sst_id)
+        //             .cloned()
+        //             .ok_or_else(|| anyhow!("Sstable {sst_id} doesn't exist in the snapshot"))
+        //     })
+        //     .collect::<Result<Vec<_>>>()?;
 
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("Thread panicked").map(Box::new))
-                .collect::<Result<Vec<_>>>()
-        })?;
-        let sst_iter = MergeIterator::create(sst_iters);
-        let sst_merge_iterator = TwoMergeIterator::create(l0_iter, sst_iter)?;
+        // let sst_iters: Vec<Box<SsTableIterator>> = std::thread::scope(|s| {
+        //     let handles: Vec<_> = level_ssts
+        //         .into_iter()
+        //         .filter_map(|sst| {
+        //             if skip_sst(
+        //                 Bound::Included(key),
+        //                 Bound::Included(key),
+        //                 sst.first_key(),
+        //                 sst.last_key(),
+        //             ) {
+        //                 None
+        //             } else if sst.bloom.is_some()
+        //                 && !sst
+        //                     .bloom
+        //                     .as_ref()
+        //                     .unwrap()
+        //                     .may_contain(farmhash::fingerprint32(key))
+        //             {
+        //                 // Bloom filter says key definitely NOT in this SST, skip it
+        //                 None
+        //             } else {
+        //                 Some(s.spawn(move || {
+        //                     SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))
+        //                 }))
+        //             }
+        //         })
+        //         .collect();
+
+        //     handles
+        //         .into_iter()
+        //         .map(|h| h.join().expect("Thread panicked").map(Box::new))
+        //         .collect::<Result<Vec<_>>>()
+        // })?;
+        // let sst_iter = MergeIterator::create(sst_iters);
+        let sst_merge_iterator = TwoMergeIterator::create(l0_iter, l1_concat_iter)?;
 
         if sst_merge_iterator.is_valid()
             && sst_merge_iterator.key().raw_ref() == key
@@ -586,7 +626,7 @@ impl LsmStorageInner {
         }
         let memtable_iter = MergeIterator::create(memtable_iters);
 
-        // At this stage we only consider L0-ssts. Will expand to further levels in future chapters
+        // L0 sst
         let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for sst_id in &snapshot.l0_sstables {
             if let Some(sst) = snapshot.sstables.get(sst_id) {
@@ -617,10 +657,35 @@ impl LsmStorageInner {
             }
         }
         let l0_iter = MergeIterator::create(l0_iters);
-
         let two_merge_iterator = TwoMergeIterator::create(memtable_iter, l0_iter)?;
+
+        // L1 sst
+        let l1_ssts: Vec<_> = snapshot.levels[0]
+            .1
+            .iter()
+            .map(|sst_id| {
+                snapshot
+                    .sstables
+                    .get(sst_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Sstable {sst_id} doesn't exist in the snapshot"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let l1_filtered_ssts = l1_ssts
+            .into_iter()
+            .filter_map(|sst| {
+                if skip_sst(lower, upper, sst.first_key(), sst.last_key()) {
+                    None
+                } else {
+                    Some(sst)
+                }
+            })
+            .collect::<Vec<_>>();
+        let l1_concat_iter = SstConcatIterator::create_and_seek_to_first(l1_filtered_ssts)?;
+        let final_merge_iterator = TwoMergeIterator::create(two_merge_iterator, l1_concat_iter)?;
+
         Ok(FusedIterator::new(LsmIterator::new(
-            two_merge_iterator,
+            final_merge_iterator,
             map_bound(upper),
         )?))
     }

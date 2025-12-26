@@ -22,7 +22,7 @@ mod tiered;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -30,8 +30,12 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
@@ -123,16 +127,155 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
-        unimplemented!()
+    fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        }; // drop global lock here
+
+        match task {
+            CompactionTask::ForceFullCompaction {
+                l0_sstables,
+                l1_sstables,
+            } => {
+                let l0_ssts: Vec<_> = l0_sstables
+                    .iter()
+                    .map(|sst_id| {
+                        snapshot.sstables.get(sst_id).cloned().ok_or_else(|| {
+                            anyhow::anyhow!("Sstable {sst_id} doesn't exist in the snapshot")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let l0_iters: Vec<Box<SsTableIterator>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = l0_ssts
+                        .into_iter()
+                        .map(|sst| s.spawn(move || SsTableIterator::create_and_seek_to_first(sst)))
+                        .collect();
+
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("Thread panicked").map(Box::new))
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                let l0_merge_iterator = MergeIterator::create(l0_iters);
+
+                let l1_ssts: Vec<_> = l1_sstables
+                    .iter()
+                    .map(|sst_id| {
+                        snapshot.sstables.get(sst_id).cloned().ok_or_else(|| {
+                            anyhow::anyhow!("Sstable {sst_id} doesn't exist in the snapshot")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let l1_concat_iterator = SstConcatIterator::create_and_seek_to_first(l1_ssts)?;
+
+                let mut merge_iterator =
+                    TwoMergeIterator::create(l0_merge_iterator, l1_concat_iterator)?;
+                let mut result_ssts: Vec<Arc<SsTable>> = Vec::new();
+                let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+                let mut pending_entries = 0usize;
+                while merge_iterator.is_valid() {
+                    if merge_iterator.value().is_empty() {
+                        merge_iterator.next()?;
+                        continue;
+                    }
+                    sst_builder.add(merge_iterator.key(), merge_iterator.value());
+                    pending_entries += 1;
+                    if sst_builder.estimated_size() >= self.options.target_sst_size {
+                        let sst_id = self.next_sst_id();
+                        let sst = sst_builder.build(
+                            sst_id,
+                            Some(self.block_cache.clone()),
+                            self.path_of_sst(sst_id),
+                        )?;
+                        debug_assert!(sst.first_key() <= sst.last_key());
+                        if let Some(prev) = result_ssts.last() {
+                            debug_assert!(prev.last_key() < sst.first_key());
+                        }
+                        result_ssts.push(Arc::new(sst));
+                        sst_builder = SsTableBuilder::new(self.options.block_size);
+                        pending_entries = 0;
+                    }
+                    merge_iterator.next()?;
+                }
+
+                // Do the final flush
+                if pending_entries > 0 {
+                    let sst_id = self.next_sst_id();
+                    let sst = sst_builder.build(
+                        sst_id,
+                        Some(self.block_cache.clone()),
+                        self.path_of_sst(sst_id),
+                    )?;
+                    debug_assert!(sst.first_key() <= sst.last_key());
+                    if let Some(prev) = result_ssts.last() {
+                        debug_assert!(prev.last_key() < sst.first_key());
+                    }
+                    result_ssts.push(Arc::new(sst));
+                }
+
+                Ok(result_ssts)
+            }
+            CompactionTask::Leveled(leveled_compaction_task) => todo!(),
+            CompactionTask::Tiered(tiered_compaction_task) => todo!(),
+            CompactionTask::Simple(simple_leveled_compaction_task) => todo!(),
+        }
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        }; // drop global lock here
+
+        let l0_sstables = snapshot.l0_sstables.to_owned();
+        let l1_sstables = snapshot.levels.first().unwrap_or(&(0, vec![])).1.to_owned();
+        let compaction_task = CompactionTask::ForceFullCompaction {
+            l0_sstables: l0_sstables.clone(),
+            l1_sstables: l1_sstables.clone(),
+        };
+
+        println!("force full compaction: {:?}", compaction_task);
+        let compaction_result = self.compact(&compaction_task)?;
+
+        {
+            let _lock = self.state_lock.lock();
+            let mut guard = self.state.write();
+            let mut state = guard.as_ref().clone();
+
+            // remove L0 ssts that were compacted (becasue there will be concurrent flush from memtable)
+            // because new flushed ssts are inserted to the front of l0_sstables so we can just truncate the remaining by finding the
+            // index of first element in the original list.
+            let stop_sst_id = l0_sstables.first().unwrap_or(&usize::MAX);
+            if let Some(idx) = state.l0_sstables.iter().position(|it| it == stop_sst_id) {
+                state.l0_sstables.truncate(idx);
+            }
+            for old_l0_sst_id in &l0_sstables {
+                state.sstables.remove(old_l0_sst_id);
+            }
+            // remove L1 ssts that were compacted. It's safe to clear because we assume no other compaction is writing to L1
+            for old_l1_sst_id in &l1_sstables {
+                state.sstables.remove(old_l1_sst_id);
+            }
+            state.levels[0].1.clear();
+            // add new ssts to L1
+            for new_sst in compaction_result.iter() {
+                state.levels[0].1.push(new_sst.sst_id());
+                state.sstables.insert(new_sst.sst_id(), new_sst.clone());
+            }
+
+            *guard = Arc::new(state);
+        }
+        for sst_id in [l0_sstables, l1_sstables].concat() {
+            let path = self.path_of_sst(sst_id);
+            std::fs::remove_file(path)?;
+        }
+
+        Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        self.force_full_compaction()
     }
 
     pub(crate) fn spawn_compaction_thread(
